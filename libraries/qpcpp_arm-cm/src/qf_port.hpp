@@ -1,9 +1,9 @@
 /// @file
-/// @brief QF/C++ port to ARM Cortex-M, cooperative QV kernel, GNU-ARM toolset
+/// @brief QF/C++ port to uC/OS-III (V3.08) kernel, all supported compilers
 /// @cond
 ///***************************************************************************
-/// Last updated for version 6.9.2
-/// Last updated on  2021-01-28
+/// Last updated for version 6.9.3
+/// Last updated on  2021-04-08
 ///
 ///                    Q u a n t u m  L e a P s
 ///                    ------------------------
@@ -38,118 +38,166 @@
 #ifndef QF_PORT_HPP
 #define QF_PORT_HPP
 
-// The maximum number of system clock tick rates
-#define QF_MAX_TICK_RATE        2U
+// uC/OS-II event queue and thread types
+#define QF_EQUEUE_TYPE       OS_Q*
+#define QF_THREAD_TYPE       OS_TCB*
+// The maximum number of active objects in the application
+#define QF_MAX_ACTIVE ((OS_CFG_PRIO_MAX - 2 < 64) ? (OS_CFG_PRIO_MAX - 2) : 64U)
 
-// QF interrupt disable/enable and log2()...
-#if (__ARM_ARCH == 6) // Cortex-M0/M0+/M1(v6-M, v6S-M)?
+#include <uCOS-III_Due.h> // uC/OS-III API, port and compile-time configuration
+                                  
 
-    // The maximum number of active objects in the application, see NOTE1
-    #define QF_MAX_ACTIVE       8U
+// uC/OS-III crtitical section, NOTE1
+#if (CPU_CFG_CRITICAL_METHOD == CPU_CRITICAL_METHOD_INT_DIS_EN)
+    /* QF_CRIT_STAT_TYPE  not defined */
+    #define QF_CRIT_ENTRY(dummy) CPU_CRITICAL_ENTER()
+    #define QF_CRIT_EXIT(dummy)  CPU_CRITICAL_EXIT()
+#elif (CPU_CFG_CRITICAL_METHOD == CPU_CRITICAL_METHOD_STATUS_LOCAL)
+    #define QF_CRIT_STAT_TYPE    CPU_SR
+    #define QF_CRIT_ENTRY(dummy) CPU_CRITICAL_ENTER()
+    #define QF_CRIT_EXIT(dummy)  CPU_CRITICAL_EXIT()
+#else
+    #error Unsupported uC/OS-III critical section type
+#endif // CPU_CFG_CRITICAL_METHOD
 
-    // Cortex-M0/M0+/M1(v6-M, v6S-M) interrupt disabling policy, see NOTE2
-    #define QF_INT_DISABLE()    __asm volatile ("cpsid i")
-    #define QF_INT_ENABLE()     __asm volatile ("cpsie i")
+namespace QP {
+                                           
+                                                 
+                                                
 
-    // QF critical section entry/exit (unconditional interrupt disabling)
-    //#define QF_CRIT_STAT_TYPE not defined
-    #define QF_CRIT_ENTRY(dummy) QF_INT_DISABLE()
-    #define QF_CRIT_EXIT(dummy)  QF_INT_ENABLE()
+enum UCOS3_TaskAttrs {
+    TASK_NAME_ATTR,
+    TASK_OPT_ATTR
+};
 
-    // CMSIS threshold for "QF-aware" interrupts, see NOTE2 and NOTE4
-    #define QF_AWARE_ISR_CMSIS_PRI 0
+} // namespace QP
+                                      
 
-    // hand-optimized LOG2 in assembly for Cortex-M0/M0+/M1(v6-M, v6S-M)
-    #define QF_LOG2(n_) QF_qlog2((n_))
+#include "qep_port.hpp"  // QEP port, includes the master uC/OS-II include
+#include "qequeue.hpp"   // used for event deferral
+#include "qmpool.hpp"    // native QF event pool
+#include "qpset.hpp"     // this QP port uses the native QP priority set
+#include "qf.hpp"        // QF platform-independent public interface
 
-#else // Cortex-M3/M4/M7
+                                                                         
+                                   
 
-    // The maximum number of active objects in the application, see NOTE1
-    #define QF_MAX_ACTIVE       16U
+//****************************************************************************
+// interface used only inside QF, but not in applications
+//
+#ifdef QP_IMPL
 
-    // Cortex-M3/M4/M7 alternative interrupt disabling with PRIMASK
-    #define QF_PRIMASK_DISABLE() __asm volatile ("cpsid i")
-    #define QF_PRIMASK_ENABLE()  __asm volatile ("cpsie i")
+    // uC/OS-II crtitical section, NOTE1
+#if (CPU_CFG_CRITICAL_METHOD == CPU_CRITICAL_METHOD_STATUS_LOCAL)
+    /* internal uC/OS-II critical section operations, NOTE1 */
+    #define QF_CRIT_STAT_       CPU_SR cpu_sr;
+    #define QF_CRIT_E_()    CPU_CRITICAL_ENTER()
+    #define QF_CRIT_X_()     CPU_CRITICAL_EXIT()
+#endif // CPU_CFG_CRITICAL_METHOD
 
-    // Cortex-M3/M4/M7 interrupt disabling policy, see NOTE3 and NOTE4
-    #define QF_INT_DISABLE() __asm volatile (\
-        "cpsid i\n" "msr BASEPRI,%0\n" "cpsie i" :: "r" (QF_BASEPRI) : )
-    #define QF_INT_ENABLE()  __asm volatile (\
-        "msr BASEPRI,%0" :: "r" (0) : )
+    // uC/OS-II-specific scheduler locking, see NOTE2
+    #define QF_SCHED_STAT_
+    #define QF_SCHED_LOCK_(dummy) do { \
+        if (OSIntNestingCtr == 0) {    \
+            OS_ERR err;               \
+            OSSchedLock(&err);         \
+        }                              \
+    } while (false)
 
-    // QF critical section entry/exit (unconditional interrupt disabling)
-    //#define QF_CRIT_STAT_TYPE not defined
-    #define QF_CRIT_ENTRY(dummy) QF_INT_DISABLE()
-    #define QF_CRIT_EXIT(dummy)  QF_INT_ENABLE()
+    #define QF_SCHED_UNLOCK_() do { \
+        if (OSIntNestingCtr == 0) {    \
+            OS_ERR err;               \
+            OSSchedLock(&err);         \
+        } \
+    } while (false)
 
-    // BASEPRI threshold for "QF-aware" interrupts, see NOTE3
-    #define QF_BASEPRI           0x3F
+    // uC/OS-III event pool operations...
+    #define QF_EPOOL_TYPE_ OS_MEM*
+    #define QF_EPOOL_INIT_(pool_, poolSto_, poolSize_, evtSize_) do {       \
+        OS_ERR err;                                                          \
+        OSMemCreate((pool_),"EPool",(poolSto_),(CPU_INT32U)((poolSize_)/(evtSize_)), \
+                              (CPU_INT32U)(evtSize_), &err);                    \
+        Q_ASSERT_ID(105, err == OS_ERR_NONE);                               \
+    } while (false)
 
-    // CMSIS threshold for "QF-aware" interrupts, see NOTE5
-    #define QF_AWARE_ISR_CMSIS_PRI (QF_BASEPRI >> (8 - __NVIC_PRIO_BITS))
+    #define QF_EPOOL_EVENT_SIZE_(pool_) ((pool_)->BlkSize)
+    #define QF_EPOOL_GET_(pool_, e_, m_, qs_id_) do { \
+        QF_CRIT_STAT_                                 \
+        QF_CRIT_E_();                                 \
+        if ((pool_)->NbrFree > (m_)) {             \
+            OS_ERR err;                                \
+            (e_) = (QEvt *)OSMemGet((pool_), &err);   \
+            Q_ASSERT_ID(205, err == OS_ERR_NONE);     \
+        }                                             \
+        else {                                        \
+            (e_) = nullptr;                           \
+        }                                             \
+        QF_CRIT_X_();                                 \
+    } while (false)
 
-    // Cortex-M3/M4/M7 provide the CLZ instruction for fast LOG2
-    #define QF_LOG2(n_) (static_cast<std::uint_fast8_t>( \
-        32U - __builtin_clz(static_cast<unsigned>(n_))))
+    #define QF_EPOOL_PUT_(pool_, e_, qs_id_)    \
+        OS_ERR err;                             \
+        OSMemPut((pool_), (e_),&err);           \
+        Q_ALLEGE_ID(305, err == OS_ERR_NONE)
 
-#endif
+#endif // ifdef QP_IMPL
 
-#define QF_CRIT_EXIT_NOP()      __asm volatile ("isb")
+                                   
 
-#include "qep_port.hpp" // QEP port
+                                                       
+                                            
+                                                 
+                                       
 
-#if (__ARM_ARCH == 6) // Cortex-M0/M0+/M1(v6-M, v6S-M)?
-    // hand-optimized quick LOG2 in assembly
-    extern "C" uint_fast8_t QF_qlog2(uint32_t x);
-#endif // Cortex-M0/M0+/M1(v6-M, v6S-M)
-
-#include "qv_port.hpp"  // QV port
-#include "qf.hpp"       // QF platform-independent public interface
-#include "Arduino.h"    // Main include file for the Arduino SDK
+                                  
+                                                                   
+                                                                
 
 //****************************************************************************
 // NOTE1:
-// The maximum number of active objects QF_MAX_ACTIVE can be increased
-// up to 64, if necessary. Here it is set to a lower level to save some RAM.
+// This QP port to uC/OS-III re-uses the exact same critical section mechanism
+// as uC/OS-II. The goal is to make this port independent on the CPU or the
+// toolchain by employing only the official uC/OS-II API. That way, all CPU
+// and toolchain dependencies are handled internally by uC/OS-II.
 //
 // NOTE2:
-// On Cortex-M0/M0+/M1 (architecture v6-M, v6S-M), the interrupt disabling
-// policy uses the PRIMASK register to disable interrupts globally. The
-// QF_AWARE_ISR_CMSIS_PRI level is zero, meaning that all interrupts are
-// "QF-aware".
+// uC/OS-II provides only global scheduler locking for all thread priorities
+// by means of OSSchedLock() and OSSchedUnlock(). Therefore, locking the
+// scheduler only up to the specified lock priority is not supported.
+              
 //
-// NOTE3:
-// On Cortex-M3/M4/M7, the interrupt disable/enable policy uses the BASEPRI
-// register (which is not implemented in Cortex-M0/M0+/M1) to disable
-// interrupts only with priority lower than the threshold specified by the
-// QF_BASEPRI macro. The interrupts with priorities above QF_BASEPRI (i.e.,
-// with numerical priority values lower than QF_BASEPRI) are NOT disabled in
-// this method. These free-running interrupts have very low ("zero") latency,
-// but they are not allowed to call any QF services, because QF is unaware
-// of them ("QF-unaware" interrutps). Consequently, only interrupts with
-// numerical values of priorities eqal to or higher than QF_BASEPRI
-// ("QF-aware" interrupts ), can call QF services.
-//
-// NOTE4:
-// The QF_AWARE_ISR_CMSIS_PRI macro is useful as an offset for enumerating
-// the "QF-aware" interrupt priorities in the applications, whereas the
-// numerical values of the "QF-aware" interrupts must be greater or equal to
-// QF_AWARE_ISR_CMSIS_PRI. The values based on QF_AWARE_ISR_CMSIS_PRI can be
-// passed directly to the CMSIS function NVIC_SetPriority(), which shifts
-// them by (8 - __NVIC_PRIO_BITS) into the correct bit position, while
-// __NVIC_PRIO_BITS is the CMSIS macro defining the number of implemented
-// priority bits in the NVIC. Please note that the macro QF_AWARE_ISR_CMSIS_PRI
-// is intended only for applications and is not used inside the QF port, which
-// remains generic and not dependent on the number of implemented priority bits
-// implemented in the NVIC.
-//
-// NOTE5:
-// The selective disabling of "QF-aware" interrupts with the BASEPRI register
-// has a problem on ARM Cortex-M7 core r0p1 (see SDEN-1068427, errata
-// 837070). The workaround recommended by ARM is to surround MSR BASEPRI with
-// the CPSID i/CPSIE i pair, which is implemented in the QF_INT_DISABLE()
-// macro. This workaround works also for Cortex-M3/M4 cores.
-//
+         
+                                                                           
+                                                                     
+                                                                          
+                                                                           
+                                                                            
+                                                                             
+                                                                          
+                                                                        
+                                                                   
+                                                  
+  
+         
+                                                                          
+                                                                       
+                                                                            
+                                                                            
+                                                                         
+                                                                      
+                                                                         
+                                                                               
+                                                                              
+                                                                               
+                           
+  
+         
+                                                                             
+                                                                     
+                                                                             
+                                                                         
+                                                            
+  
 
 #endif // QF_PORT_HPP
 
